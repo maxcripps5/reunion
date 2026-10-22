@@ -1,7 +1,14 @@
+# API keys and secrets
 .env
-.env.*
-!.env.example
-.venv/
-venv/
+sk.py
+
+# Python cache files
 __pycache__/
-*.py[cod]
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+
+# IDE settings
+.vscode/
