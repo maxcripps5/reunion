@@ -1,13 +1,13 @@
+
 import time
 import json
 import base64
-import keyboard
 import io
 import wave
+import keyboard
 import threading
 import numpy as np
 import sounddevice as sd
-import speech_recognition as sr
 
 from openai import OpenAI
 from sk import my_sk
@@ -26,28 +26,34 @@ AUDIO_SAMPLE_RATE = 48000
 TTS_SAMPLE_RATE = 24000
 
 #Audio buffers
+recording_active = False
 recording_chunks = []
 recording_lock = threading.Lock()
 tts_buffer = np.zeros(0, dtype=np.float32)
 tts_lock = threading.Lock()
 
-#Mic calibration
-recognizer = sr.Recognizer()
-recognizer.dynamic_energy_threshold = False
+SILENCE_VOL_THRESHOLD = 0.02
 
-#Audio mixer
+
+#Connect to OpenAI
+client = OpenAI(api_key=my_sk)
+
+
+#Audio mixer and microphone recording
 def audio_callback(indata, outdata, frames, time_info, status):
     global tts_buffer
 
-    #Continous microphone passthrough
+    #Print status update when program starts
+    # if status:
+    #     print(getTime(), ": Audio status:", status)
+
+    #Continuous microphone passthrough
     outdata[:] = indata
 
-
-    #Record microphone will F8 is held
-    if keyboard.is_pressed("F8"):
+    #Record microphone while F8 is held
+    if recording_active:
         with recording_lock:
             recording_chunks.append(indata.copy())
-
 
     #Mix Mandarin TTS with microphone input
     with tts_lock:
@@ -57,40 +63,41 @@ def audio_callback(indata, outdata, frames, time_info, status):
             outdata[:count, 0] += tts_buffer[:count]
             tts_buffer = tts_buffer[count:]
 
-
-    #Prevent audio clipping **REASSESS
+    #Prevent audio clipping
     np.clip(outdata, -1.0, 1.0, out=outdata)
 
-#Connect to OpenAI
-client = OpenAI(api_key=my_sk)
 
 #Speech to text and translation (English to Mandarin)
 def get_input(audio_chunks):
     try:
         if not audio_chunks:
-            print(getTime(), ": No audio recorded.")
+            print(getTime(), ": No audio recorded. Skipping transcription.")
             return "", ""
 
-
-        #Combine shared input (TTS and mic stream)
+        #Combine recorded microphone audio
         audio = np.concatenate(audio_chunks, axis=0).flatten()
 
+        #Skip audio that is effectively silent
+        rms = float(np.sqrt(np.mean(audio ** 2)))
 
-        #Convert float32 audio to 16bit
+        if rms < SILENCE_VOL_THRESHOLD:
+            print(getTime(), ": Recording is silent. Skipping transcription.")
+            return "", ""
+
+        #Convert float32 audio to 16-bit PCM
         audio = np.clip(audio, -1.0, 1.0)
         audio = (audio * 32767).astype(np.int16)
 
+        #Convert audio to WAV format
+        wav_buffer = io.BytesIO()
 
-        #Convert audio to WAV
-        audio_data = sr.AudioData(
-            audio.tobytes(),
-            AUDIO_SAMPLE_RATE,
-            2
-        )
+        with wave.open(wav_buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(AUDIO_SAMPLE_RATE)
+            wav_file.writeframes(audio.tobytes())
 
-
-        #Convert audio to WAV data
-        wav_data = audio_data.get_wav_data()
+        wav_data = wav_buffer.getvalue()
         encoded_audio = base64.b64encode(wav_data).decode("utf-8")
 
         #Send audio for transcription and translation
@@ -138,6 +145,11 @@ def get_input(audio_chunks):
         english_text = result["english"].strip()
         mandarin_text = result["mandarin"].strip()
 
+        #Skip empty transcription results
+        if not english_text or not mandarin_text:
+            print(getTime(), ": No usable speech detected. Skipping playback.")
+            return "", ""
+
         print(getTime(), ": EN:", english_text)
         print(getTime(), ": CN:", mandarin_text)
         print(
@@ -149,7 +161,7 @@ def get_input(audio_chunks):
 
     #Exception handling
     except Exception as e:
-        print(getTime(), ": Combined audio request error:", e)
+        print(getTime(), ": Combined audio request error:", repr(e))
         return "", ""
 
 
@@ -158,21 +170,21 @@ def speak_mandarin(text):
     try:
         start = time.perf_counter()
 
-        #Generate Mandarin speech synchronously
+        #Generate Mandarin speech
         response = client.audio.speech.create(
             model="gpt-4o-mini-tts",
             voice="coral",
             input=text,
-            instructions=(
-                "Speak Mandarin naturally with standard pronunciation."
-            ),
+            instructions="Speak Mandarin naturally with standard pronunciation.",
             response_format="pcm"
         )
 
-        #Read the returned PCM audio
+        #Read returned PCM audio
         audio_bytes = response.content
-        audio = np.frombuffer(audio_bytes, dtype=np.int16
-        ).astype(np.float32) / 32768.0
+        audio = (
+            np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+            / 32768.0
+        )
 
         if len(audio) == 0:
             print(getTime(), ": TTS returned empty audio.")
@@ -196,7 +208,6 @@ def speak_mandarin(text):
         with tts_lock:
             tts_buffer = np.concatenate((tts_buffer, audio))
 
-
         print(
             f"Speech generation and playback took "
             f"{time.perf_counter() - start:.2f}s"
@@ -205,23 +216,6 @@ def speak_mandarin(text):
     #Exception handling
     except Exception as e:
         print(getTime(), ": TTS error:", repr(e))
-
-
-#Microphone calibration
-try:
-    print(getTime(), ": Checking microphone...")
-
-
-    with sr.Microphone(device_index=MIC_INPUT_DEVICE) as source:
-        recognizer.adjust_for_ambient_noise(source, duration=0.3)
-
-
-    print(getTime(), ": Microphone calibration completed.")
-
-
-except Exception as e:
-    print(getTime(), ": Microphone setup error:", e)
-    raise
 
 
 #Start audio stream
@@ -234,10 +228,8 @@ try:
         callback=audio_callback
     )
 
-
     audio_stream.start()
-    print(getTime(), ": Audio stream started.")
-
+    print(getTime(), ": Audio stream started. Hold F8 to speak.")
 
 except Exception as e:
     print(getTime(), ": Audio stream error:", repr(e))
@@ -245,51 +237,46 @@ except Exception as e:
 
 
 #Main translation loop
-while True:
-    try:
+try:
+    while True:
         #Clear previous recording
         with recording_lock:
             recording_chunks.clear()
 
-
         #Wait for F8 to be pressed
         keyboard.wait("F8")
 
+        with recording_lock:
+            recording_chunks.clear()
 
-        print(getTime(), "Recording... release F8 to translate.")
+        recording_active = True
+        print(getTime(), ": Recording... release F8 to translate.")
 
-
-        #Wait until F8 is released before accepting another recording
+        #Record until F8 is released
         while keyboard.is_pressed("F8"):
             time.sleep(0.01)
 
+        recording_active = False
 
         #Copy recorded audio
         with recording_lock:
             audio_chunks = recording_chunks.copy()
             recording_chunks.clear()
 
-
-        #Get transcription and translation together
+        #Transcribe and translate
         recognized_text, translated_text = get_input(audio_chunks)
-
 
         if not recognized_text or not translated_text:
             continue
 
-
         #Generate Mandarin speech
         speak_mandarin(translated_text)
 
+except KeyboardInterrupt:
+    print(getTime(), ": Reunion stopped.")
 
-    #Exception handling
-    except KeyboardInterrupt:
-        print(getTime(), "Reunion stopped.")
-        break
-
-    except Exception as e:
-        print(
-            getTime(),
-            ": Error during translation cycle:",
-            repr(e)
-        )
+finally:
+    #Stop the audio stream
+    recording_active = False
+    audio_stream.stop()
+    audio_stream.close()
