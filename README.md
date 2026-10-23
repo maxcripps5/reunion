@@ -6,5 +6,4 @@ Use application to speak in English and have live audio translation to Mandarin 
 GUI vars to add in settings:
 - SILENCE_VOL_THRESHOLD (silence detection volume)
 - MIC_INPUT_DEVICE (recording device)
-- SILENCE_TIMEOUT (silence in seconds before timeout)
 - shouldTimeout (toggleable setting for silence detector. TBA)
