@@ -8,11 +8,21 @@ import keyboard
 import threading
 import numpy as np
 import sounddevice as sd
+import soundcard as sc
+import queue
+import re
+import warnings
 
 from openai import OpenAI
 from sk import my_sk
 from datetime import datetime
 
+#Suppress SoundCard errors prompts (temporary)
+warnings.filterwarnings(
+    "ignore",
+    message="data discontinuity in recording",
+    category=RuntimeWarning
+)
 
 #Datetime
 def getTime():
@@ -32,6 +42,15 @@ recording_lock = threading.Lock()
 tts_buffer = np.zeros(0, dtype=np.float32)
 tts_lock = threading.Lock()
 
+#Incoming audio
+INCOMING_SPEECH_THRESHOLD = 0.035
+INCOMING_SILENCE_SECONDS = 0.75
+INCOMING_MAX_SEGMENT_SECONDS = 10
+
+incoming_audio_queue = queue.Queue(maxsize=5)
+shutdown_event = threading.Event()
+
+#Silence audio detection
 SILENCE_VOL_THRESHOLD = 0.02
 
 
@@ -42,10 +61,6 @@ client = OpenAI(api_key=my_sk)
 #Audio mixer and microphone recording
 def audio_callback(indata, outdata, frames, time_info, status):
     global tts_buffer
-
-    #Print status update when program starts
-    # if status:
-    #     print(getTime(), ": Audio status:", status)
 
     #Continuous microphone passthrough
     outdata[:] = indata
@@ -176,7 +191,8 @@ def speak_mandarin(text):
             voice="coral",
             input=text,
             instructions="Speak Mandarin naturally with standard pronunciation.",
-            response_format="pcm"
+            response_format="pcm",
+            speed=1.25
         )
 
         #Read returned PCM audio
@@ -213,9 +229,254 @@ def speak_mandarin(text):
             f"{time.perf_counter() - start:.2f}s"
         )
 
-    #Exception handling
+    #Exception handlin
     except Exception as e:
         print(getTime(), ": TTS error:", repr(e))
+
+
+
+#Text to speech (English)
+def speak_english(text):
+    try:
+        response = client.audio.speech.create(
+            model="gpt-4o-mini-tts",
+            voice="coral",
+            input=text,
+            instructions="Speak English clearly and naturally.",
+            response_format="pcm",
+            speed=1.25
+        )
+
+        audio = (
+            np.frombuffer(response.content, dtype=np.int16)
+            .astype(np.float32) / 32768.0
+        )
+
+        if len(audio) == 0:
+            return
+
+        old_positions = np.arange(len(audio))
+        new_length = int(
+            len(audio) * AUDIO_SAMPLE_RATE / TTS_SAMPLE_RATE
+        )
+
+        audio = np.interp(
+            np.arange(new_length) * TTS_SAMPLE_RATE / AUDIO_SAMPLE_RATE,
+            old_positions,
+            audio
+        ).astype(np.float32)
+
+        sd.play(
+            audio,
+            samplerate=AUDIO_SAMPLE_RATE,
+            device=sd.default.device[1]
+        )
+        sd.wait()
+
+    except Exception as e:
+        print(getTime(), ": English TTS error:", repr(e))
+
+
+
+#Find the loopback microphone for the default playback device
+def find_loopback_device():
+    speaker = sc.default_speaker()
+
+    if speaker is None:
+        raise RuntimeError("No default playback device found.")
+
+    speaker_name = speaker.name
+
+    def normalize(name):
+        return re.sub(r"[^a-z0-9]", "", name.lower())
+
+    normalized_speaker = normalize(speaker_name)
+
+    microphones = sc.all_microphones(include_loopback=True)
+
+    loopbacks = [
+        mic for mic in microphones
+        if getattr(mic, "isloopback", False)
+    ]
+
+    #Try an exact device name match first
+    for mic in loopbacks:
+        if normalize(mic.name) == normalized_speaker:
+            print(getTime(), ": Incoming audio device:", mic.name)
+            return mic
+
+    #Try a partial name match
+    for mic in loopbacks:
+        normalized_name = normalize(mic.name)
+
+        if (
+            normalized_speaker in normalized_name
+            or normalized_name in normalized_speaker
+        ):
+            print(getTime(), ": Incoming audio device:", mic.name)
+            return mic
+
+    available = ", ".join(mic.name for mic in loopbacks)
+
+    raise RuntimeError(
+        f"Could not match '{speaker_name}' to a loopback device. "
+        f"Available loopback devices: {available}"
+    )
+
+
+
+#Record incoming audio 
+def incoming_audio_worker():
+    try:
+        device = find_loopback_device()
+        sample_rate = int(device.samplerate) if hasattr(device, "samplerate") else 48000
+        block_size = max(1, int(sample_rate * 0.25))
+
+        print(getTime(), ": Listening for incoming speech...")
+
+        with device.recorder(
+            samplerate=sample_rate,
+            channels=2
+        ) as recorder:
+            audio_buffer = []
+            silence_duration = 0.0
+            speech_detected = False
+
+            while not shutdown_event.is_set():
+                audio = recorder.record(
+                    numframes=block_size
+                )
+
+                if audio.size == 0:
+                    continue
+
+                if audio.ndim > 1:
+                    audio = np.mean(audio, axis=1)
+
+                rms = float(np.sqrt(np.mean(audio ** 2)))
+                duration = len(audio) / sample_rate
+
+                if rms >= INCOMING_SPEECH_THRESHOLD:
+                    speech_detected = True
+                    silence_duration = 0.0
+                    audio_buffer.append(audio.copy())
+                    print(f"Incoming audio RMS: {rms:.6f}")
+
+                elif speech_detected:
+                    audio_buffer.append(audio.copy())
+                    silence_duration += duration
+
+                buffered_seconds = sum(
+                    len(chunk) for chunk in audio_buffer
+                ) / sample_rate
+
+                if speech_detected and (
+                    silence_duration >= INCOMING_SILENCE_SECONDS
+                    or buffered_seconds >= INCOMING_MAX_SEGMENT_SECONDS
+                ):
+                    segment = np.concatenate(audio_buffer)
+
+                    try:
+                        incoming_audio_queue.put(
+                            (segment, sample_rate),
+                            timeout=1
+                        )
+                    except queue.Full:
+                        print(getTime(), ": Incoming queue full; segment skipped.")
+
+                    audio_buffer = []
+                    silence_duration = 0.0
+                    speech_detected = False
+
+    except Exception as e:
+        print(getTime(), ": Incoming recorder error:", repr(e))
+
+
+#Convert incoming audio to WAV format
+def create_wav(audio, sample_rate):
+    audio = np.clip(audio, -1.0, 1.0)
+    audio = (audio * 32767).astype(np.int16)
+
+    wav_buffer = io.BytesIO()
+
+    with wave.open(wav_buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(audio.tobytes())
+
+    return wav_buffer.getvalue()
+
+
+#Transcribe incoming Mandarin and translate to English
+def process_incoming_audio():
+    while not shutdown_event.is_set():
+        try:
+            item = incoming_audio_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+
+        if item is None:
+            break
+
+        audio, sample_rate = item
+
+        try:
+            wav_data = create_wav(audio, sample_rate)
+            encoded_audio = base64.b64encode(wav_data).decode("utf-8")
+
+            response = client.chat.completions.create(
+                model="gpt-audio-1.5",
+                modalities=["text"],
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "If the spoken language is Mandarin, transcribe it using Simplified Chinese "
+                            "Translate it into natural English. "
+                            "Return only valid JSON with string fields named mandarin and english. "
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_audio",
+                                "input_audio": {
+                                    "data": encoded_audio,
+                                    "format": "wav"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            )
+
+            content = response.choices[0].message.content
+
+            if not content:
+                print(getTime(), ": Empty incoming translation response.")
+                continue
+
+            result = json.loads(content)
+            mandarin_text = result["mandarin"].strip()
+            english_text = result["english"].strip()
+
+            if mandarin_text:
+                print(getTime(), ": Received CN:", mandarin_text)
+
+            if english_text:
+                print(getTime(), ": English translation:", english_text)
+                #speak_english(english_text)
+
+
+        except Exception as e:
+            print(getTime(), ": Incoming translation error:", repr(e))
+
+        finally:
+            incoming_audio_queue.task_done()
+
+
 
 
 #Start audio stream
@@ -230,6 +491,20 @@ try:
 
     audio_stream.start()
     print(getTime(), ": Audio stream started. Hold F8 to speak.")
+
+
+    #Start incoming audio processing
+    threading.Thread(
+        target=incoming_audio_worker,
+        daemon=True
+    ).start()
+
+
+    threading.Thread(
+        target=process_incoming_audio,
+        daemon=True
+    ).start()
+
 
 except Exception as e:
     print(getTime(), ": Audio stream error:", repr(e))
@@ -276,6 +551,7 @@ except KeyboardInterrupt:
     print(getTime(), ": Reunion stopped.")
 
 finally:
+    shutdown_event.set()
     #Stop the audio stream
     recording_active = False
     audio_stream.stop()
