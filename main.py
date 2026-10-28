@@ -31,7 +31,7 @@ def getTime():
 
 #Audio devices
 MIC_INPUT_DEVICE = None
-TTS_OUTPUT_DEVICE = 7
+TTS_OUTPUT_DEVICE = None
 AUDIO_SAMPLE_RATE = 48000
 TTS_SAMPLE_RATE = 24000
 
@@ -56,6 +56,36 @@ SILENCE_VOL_THRESHOLD = 0.02
 
 #Connect to OpenAI
 client = OpenAI(api_key=my_sk)
+
+
+#Automatically find the VB-CABLE playback device (which feeds its virtual microphone)
+def find_virtual_microphone_output():
+    devices = sd.query_devices()
+    candidates = []
+
+    for index, device in enumerate(devices):
+        name = device["name"].lower()
+        if device["max_output_channels"] <= 0:
+            continue
+
+        #VB-CABLE's playback side is named CABLE Input on Windows
+        if "cable input" in name or ("vb-audio" in name and "cable" in name):
+            candidates.append((index, device["name"]))
+
+    if not candidates:
+        available = "\n".join(
+            f"{i}: {device['name']} (outputs: {device['max_output_channels']})"
+            for i, device in enumerate(devices)
+        )
+        raise RuntimeError(
+            "Could not automatically find VB-CABLE's playback device. "
+            "Make sure VB-CABLE is installed and enabled. Available devices:\n"
+            + available
+        )
+
+    index, name = candidates[0]
+    print(getTime(), f": Automatically detected virtual microphone output: {name} (device {index})")
+    return index
 
 
 #Audio mixer and microphone recording
@@ -269,7 +299,7 @@ def speak_english(text):
         sd.play(
             audio,
             samplerate=AUDIO_SAMPLE_RATE,
-            device=sd.default.device[1]
+            device=None
         )
         sd.wait()
 
@@ -360,7 +390,6 @@ def incoming_audio_worker():
                     speech_detected = True
                     silence_duration = 0.0
                     audio_buffer.append(audio.copy())
-                    print(f"Incoming audio RMS: {rms:.6f}")
 
                 elif speech_detected:
                     audio_buffer.append(audio.copy())
@@ -477,10 +506,12 @@ def process_incoming_audio():
             incoming_audio_queue.task_done()
 
 
-
-
 #Start audio stream
 try:
+    #Send microphone passthrough and Mandarin TTS to the virtual microphone.
+    #The computer's default speaker/headphone output remains unchanged.
+    TTS_OUTPUT_DEVICE = find_virtual_microphone_output()
+
     audio_stream = sd.Stream(
         device=(MIC_INPUT_DEVICE, TTS_OUTPUT_DEVICE),
         samplerate=AUDIO_SAMPLE_RATE,
@@ -545,7 +576,7 @@ try:
             continue
 
         #Generate Mandarin speech
-        speak_mandarin(translated_text)
+        speak_mandarin(translated_text)     
 
 except KeyboardInterrupt:
     print(getTime(), ": Reunion stopped.")
