@@ -1,7 +1,7 @@
 #MAIN - Main project file for Reunion
 import threading
 import sounddevice as sd
-
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    
 import audio
 import config
 import translation

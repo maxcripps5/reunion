@@ -1,4 +1,3 @@
-
 #TRANSLATE - Transcription & Translation using OpenAI
 import time
 import json
@@ -7,7 +6,12 @@ import io
 import wave
 import queue
 import numpy as np
+import jieba
+import re
 
+from pypinyin import lazy_pinyin, Style
+
+#Project files
 import config
 import audio
 from utils import getTime
@@ -139,14 +143,14 @@ def get_input(audio_chunks):
 
         #Skip empty transcription results
         if not english_text or not mandarin_text:
-            print(
-                getTime(),
-                ": No usable speech detected. Skipping playback."
-            )
+            # print(
+            #     getTime(),
+            #     ": No usable speech detected. Skipping playback."
+            # )
             return "", ""
 
-        print(getTime(), ": EN:", english_text)
-        print(getTime(), ": CN:", mandarin_text)
+        print(getTime(), ": YOU:", english_text)
+        #print(getTime(), ": CN:", mandarin_text)
 
         print(
             f"Combined transcription and translation took "
@@ -176,6 +180,7 @@ def process_incoming_audio():
             continue
 
         if item is None:
+            audio.incoming_audio_queue.task_done()
             break
 
         audio_data, sample_rate = item
@@ -214,6 +219,9 @@ def process_incoming_audio():
                 wav_data
             ).decode("utf-8")
 
+            #Send incoming audio for transcription and translation
+            start = time.perf_counter()
+
             response = config.client.chat.completions.create(
                 model="gpt-audio-1.5",
                 modalities=["text"],
@@ -227,8 +235,8 @@ def process_incoming_audio():
                             "Do not guess, invent, complete, or infer "
                             "missing words. Do not interpret silence, "
                             "background noise, or unclear sounds as "
-                            "speech. If no clear Mandarin speech is "
-                            "audible, return an empty string for both "
+                            "speech. If no clear Mandarin speech "
+                            "is audible, return an empty string for both "
                             "mandarin and english. "
                             "Translate the accurate Mandarin "
                             "transcription into natural English. "
@@ -253,6 +261,7 @@ def process_incoming_audio():
                 ]
             )
 
+            #Read transcription and translation
             content = response.choices[0].message.content
 
             if not content:
@@ -262,6 +271,7 @@ def process_incoming_audio():
                 )
                 continue
 
+            #Parse the returned JSON
             result = json.loads(content)
 
             mandarin_text = result.get("mandarin", "").strip()
@@ -269,27 +279,44 @@ def process_incoming_audio():
 
             #Skip empty transcription results
             if not mandarin_text or not english_text:
-                print(
-                    getTime(),
-                    ": No usable incoming speech detected. Skipping translation."
-                )
+                # print(
+                #     getTime(),
+                #     ": No usable incoming speech detected. Skipping translation."
+                # )
                 continue
 
-            # if mandarin_text:
-            #     print(
-            #         getTime(),
-            #         ": Received CN:",
-            #         mandarin_text
-            #     )
+            #Convert Mandarin transcription to Pinyin and use Jieba to keep the words intact
+            words = jieba.cut(mandarin_text)
+
+            mandarin_pinyin = " ".join(
+                "".join(lazy_pinyin(word, style=Style.TONE))
+                for word in words
+            )
+
+            #Remove spaces before punctuation
+            mandarin_pinyin = re.sub(r"\s+([，。！？；：])", r"\1", mandarin_pinyin)
 
             if english_text:
                 print(
                     getTime(),
-                    ": RECEIVER:",
+                    ": CALLER:",
                     english_text
                 )
 
+                print(
+                    getTime(),
+                    ": PINYIN:",
+                    mandarin_pinyin
+                )
+
+                #Disabled feature - English TTS
                 #speech.speak_english(english_text)
+
+            #Log incoming translation processing time
+            print(
+                f"Incoming transcription and translation took "
+                f"{time.perf_counter() - start:.2f}s"
+            )
 
         except Exception as e:
             print(

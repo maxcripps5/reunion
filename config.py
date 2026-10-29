@@ -1,5 +1,7 @@
 #CONFIG - Vars that will be changeable in the GUI
 import warnings
+
+#Project files
 from openai import OpenAI
 from sk import my_sk
 
@@ -11,7 +13,11 @@ warnings.filterwarnings(
 )
 
 #OpenAI
-client = OpenAI(api_key=my_sk)
+client = OpenAI(
+    api_key=my_sk,
+    timeout=60.0,
+    max_retries=1
+)
 
 #Audio devices
 MIC_INPUT_DEVICE = None

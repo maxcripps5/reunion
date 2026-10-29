@@ -2,6 +2,7 @@
 import time
 import keyboard
 
+#Project files
 import audio
 import translation
 import speech
